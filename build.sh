@@ -35,11 +35,12 @@ resolve_development_team() {
 
 run_public_build() {
     local signing_mode="$1"
+    local configuration="${FLUIDVOICE_CONFIGURATION:-Debug}"
     local development_team
     local -a build_args=(
         -project Fluid.xcodeproj
         -scheme Fluid
-        -configuration Debug
+        -configuration "${configuration}"
         -destination 'platform=macOS'
         -derivedDataPath "${DERIVED_DATA_PATH}"
         build
@@ -82,7 +83,7 @@ EOF
     fi
 
     echo "Running signed public FluidVoice build..."
-    echo "Build product: ${DERIVED_DATA_PATH}/Build/Products/Debug/FluidVoice Debug.app"
+    echo "Build product: ${DERIVED_DATA_PATH}/Build/Products/${configuration}/FluidVoice.app"
     exec xcodebuild "${build_args[@]}" DEVELOPMENT_TEAM="${development_team}"
 }
 

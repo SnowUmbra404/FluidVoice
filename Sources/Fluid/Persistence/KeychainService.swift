@@ -26,6 +26,12 @@ final class KeychainService {
     private let service = "com.fluidvoice.provider-api-keys"
     private let account = "fluidApiKeys"
 
+    // Memory cache: settings load calls fetchKey once per configured
+    // provider; without caching that is one keychain read (and one
+    // SecurityAgent prompt per foreign ACL) per provider per launch.
+    private var cachedKeys: [String: String] = [:]
+    private var hasLoadedKeys = false
+
     private init() {}
 
     // MARK: - Public API
@@ -131,6 +137,10 @@ final class KeychainService {
     // MARK: - Private helpers
 
     private func loadStoredKeys() throws -> [String: String] {
+        if self.hasLoadedKeys {
+            return self.cachedKeys
+        }
+
         var query = self.aggregatedQuery()
         query[kSecReturnData as String] = kCFBooleanTrue
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -147,7 +157,10 @@ final class KeychainService {
                 return [:]
             }
             do {
-                return try JSONDecoder().decode([String: String].self, from: data)
+                let keys = try JSONDecoder().decode([String: String].self, from: data)
+                self.cachedKeys = keys
+                self.hasLoadedKeys = true
+                return keys
             } catch {
                 throw KeychainServiceError.invalidData
             }
@@ -159,6 +172,10 @@ final class KeychainService {
     }
 
     private func saveStoredKeys(_ keys: [String: String]) throws {
+        // Invalidate first so a failed write cannot serve stale data.
+        self.cachedKeys = [:]
+        self.hasLoadedKeys = false
+
         let data = try JSONEncoder().encode(keys)
 
         var attributes = self.aggregatedQuery()
@@ -169,6 +186,8 @@ final class KeychainService {
         switch status {
         case errSecSuccess:
             try self.removeLegacyEntries()
+            self.cachedKeys = keys
+            self.hasLoadedKeys = true
             return
         case errSecDuplicateItem:
             let updateAttributes: [String: Any] = [
@@ -182,6 +201,8 @@ final class KeychainService {
                 throw KeychainServiceError.unhandled(updateStatus)
             }
             try self.removeLegacyEntries()
+            self.cachedKeys = keys
+            self.hasLoadedKeys = true
         default:
             throw KeychainServiceError.unhandled(status)
         }

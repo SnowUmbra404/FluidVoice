@@ -3058,8 +3058,11 @@ struct BottomOverlayView: View {
 
                     if self.isPillSize {
                         // Glossy border: a bright highlight that slowly rotates around the edge.
-                        // Paused under reduce-motion to avoid continuous redraws on low-resource Macs.
-                        if self.reduceMotion || !self.contentState.isBottomOverlayPresented {
+                        // Paused under reduce-motion to avoid continuous redraws on low-resource Macs,
+                        // and frozen while idle: only the AI-processing phase spins. Recording already
+                        // animates the level waveform, so an idle pill draws nothing (zero redraws).
+                        if self.reduceMotion || !self.contentState.isBottomOverlayPresented
+                            || !self.contentState.isProcessing {
                             RoundedRectangle(cornerRadius: self.layout.cornerRadius)
                                 .strokeBorder(
                                     AngularGradient(
@@ -3077,7 +3080,12 @@ struct BottomOverlayView: View {
                                     lineWidth: 1.2
                                 )
                         } else {
-                            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                            // 6 fps: the border's rotation period is 6s, so 36
+                            // frames per revolution is visually identical to 30
+                            // fps while cutting redraw cost ~5x. This view stays
+                            // live while the pill is presented, so it is the
+                            // main idle-CPU driver when not dictating.
+                            TimelineView(.animation(minimumInterval: 1.0 / 6.0)) { timeline in
                                 let seconds = max(
                                     0,
                                     timeline.date.timeIntervalSince(self.borderAnimationStartedAt ?? timeline.date)

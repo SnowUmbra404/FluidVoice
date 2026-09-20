@@ -14,15 +14,28 @@ enum AnalyticsDatabaseError: Error {
 
 /// SQLite aggregates and crash-safe upload outbox.
 final class AnalyticsDatabase {
+    private static let performanceBucketUpperBounds = [
+        25, 50, 75, 100, 150, 200, 300, 500, 750, 1000,
+        1500, 2000, 3000, 5000, 7500, 10_000, 20_000, 60_000,
+    ]
+
     private let connection: OpaquePointer
     private let distinctID: String
     private let appVersion: String
+    private let systemConfiguration: AnalyticsSystemConfiguration
     private let calendar: Calendar
     private let iso8601 = ISO8601DateFormatter()
 
-    init(url: URL, distinctID: String, appVersion: String, calendar: Calendar = .current) throws {
+    init(
+        url: URL,
+        distinctID: String,
+        appVersion: String,
+        systemConfiguration: AnalyticsSystemConfiguration = .current,
+        calendar: Calendar = .current
+    ) throws {
         self.distinctID = distinctID
         self.appVersion = appVersion
+        self.systemConfiguration = systemConfiguration
         self.calendar = calendar
 
         try FileManager.default.createDirectory(
@@ -111,6 +124,35 @@ final class AnalyticsDatabase {
         }
     }
 
+    func recordDictationPerformance(
+        asrMilliseconds: Int?,
+        fluidIntelligenceMilliseconds: Int?,
+        measuredAppVersion: String,
+        at date: Date
+    ) throws {
+        guard asrMilliseconds != nil || fluidIntelligenceMilliseconds != nil else { return }
+        try self.finalizeDays(before: date)
+        let day = self.dayString(date)
+        try self.transaction {
+            if let asrMilliseconds {
+                try self.upsertPerformanceMetric(
+                    day: day,
+                    measuredAppVersion: measuredAppVersion,
+                    metric: "asr",
+                    milliseconds: asrMilliseconds
+                )
+            }
+            if let fluidIntelligenceMilliseconds {
+                try self.upsertPerformanceMetric(
+                    day: day,
+                    measuredAppVersion: measuredAppVersion,
+                    metric: "fluid_intelligence",
+                    milliseconds: fluidIntelligenceMilliseconds
+                )
+            }
+        }
+    }
+
     func recordOnboardingStarted(origin: AnalyticsOnboardingOrigin, at date: Date) throws {
         try self.finalizeDays(before: date)
         try self.transaction {
@@ -133,6 +175,9 @@ final class AnalyticsDatabase {
     ) throws {
         try self.transaction {
             let flowID = try self.activeOnboardingFlow(origin: origin, at: date)
+            if step == .playground {
+                try self.ensureOnboardingTryoutState(flowID: flowID, enteredAt: date)
+            }
             let key = "onboarding:\(flowID):viewed:\(step.rawValue)"
             guard try self.insertDedupeKey(key, date: date) else { return }
             try self.enqueue(.onboardingStepViewed, at: date, properties: [
@@ -141,6 +186,92 @@ final class AnalyticsDatabase {
                 "step": step.rawValue,
             ])
         }
+    }
+
+    func recordOnboardingTryoutAttemptStarted(
+        startMethod: AnalyticsOnboardingTryoutStartMethod,
+        origin: AnalyticsOnboardingOrigin,
+        at date: Date
+    ) throws {
+        try self.transaction {
+            let flowID = try self.activeOnboardingFlow(origin: origin, at: date)
+            try self.ensureOnboardingTryoutState(flowID: flowID, enteredAt: date)
+            try self.run(
+                "UPDATE onboarding_tryout_state SET attempt_count = attempt_count + 1, " +
+                    "last_start_method = ?, last_outcome = NULL, last_failure_stage = NULL WHERE flow_id = ?",
+                bindings: [.text(startMethod.rawValue), .text(flowID)]
+            )
+        }
+    }
+
+    func recordOnboardingTryoutAttemptResult(
+        outcome: AnalyticsOnboardingTryoutOutcome,
+        failureStage: AnalyticsOnboardingTryoutFailureStage?,
+        origin: AnalyticsOnboardingOrigin,
+        at date: Date
+    ) throws {
+        try self.transaction {
+            let flowID = try self.activeOnboardingFlow(origin: origin, at: date)
+            try self.ensureOnboardingTryoutState(flowID: flowID, enteredAt: date)
+            try self.run(
+                "UPDATE onboarding_tryout_state SET last_outcome = ?, last_failure_stage = ? WHERE flow_id = ?",
+                bindings: [
+                    .text(outcome.rawValue),
+                    failureStage.map { .text($0.rawValue) } ?? .null,
+                    .text(flowID),
+                ]
+            )
+        }
+    }
+
+    func finishOnboardingTryout(
+        outcome: AnalyticsOnboardingTryoutOutcome,
+        failureStage: AnalyticsOnboardingTryoutFailureStage?,
+        origin: AnalyticsOnboardingOrigin,
+        at date: Date
+    ) throws {
+        try self.transaction {
+            let flowID = try self.activeOnboardingFlow(origin: origin, at: date)
+            try self.ensureOnboardingTryoutState(flowID: flowID, enteredAt: date)
+            let state = try self.onboardingTryoutState(flowID: flowID)
+            guard try self.insertDedupeKey("onboarding:\(flowID):tryout_finished", date: date) else { return }
+
+            var properties: [String: Any] = [
+                "flow_id": flowID,
+                "origin": origin.rawValue,
+                "outcome": outcome.rawValue,
+                "duration_bucket": Self.onboardingTryoutDurationBucket(
+                    date.timeIntervalSince1970 - state.enteredAt
+                ),
+            ]
+            if state.attemptCount > 0 {
+                properties["attempt_count_bucket"] = Self.onboardingTryoutAttemptCountBucket(state.attemptCount)
+            }
+            if let startMethod = state.lastStartMethod {
+                properties["start_method"] = startMethod
+            }
+            if let failureStage {
+                properties["failure_stage"] = failureStage.rawValue
+            } else if outcome == .skippedAfterAttempt, let lastFailureStage = state.lastFailureStage {
+                properties["failure_stage"] = lastFailureStage
+            }
+            try self.enqueue(.onboardingTryoutFinished, at: date, properties: properties)
+        }
+    }
+
+    func skipOnboardingTryout(origin: AnalyticsOnboardingOrigin, at date: Date) throws {
+        let flowID = try self.activeOnboardingFlow(origin: origin, at: date)
+        try self.ensureOnboardingTryoutState(flowID: flowID, enteredAt: date)
+        let state = try self.onboardingTryoutState(flowID: flowID)
+        let outcome: AnalyticsOnboardingTryoutOutcome = state.attemptCount == 0
+            ? .skippedBeforeAttempt
+            : .skippedAfterAttempt
+        try self.finishOnboardingTryout(
+            outcome: outcome,
+            failureStage: nil,
+            origin: origin,
+            at: date
+        )
     }
 
     func recordOnboardingStepCompleted(
@@ -273,8 +404,14 @@ final class AnalyticsDatabase {
                 "WHERE day < ? ORDER BY day, role, mode, provider, model",
             bindings: [.text(today)]
         )
+        let performanceRows = try self.query(
+            "SELECT day, measured_app_version, measured_os_version, metric, bucket_index, sample_count " +
+                "FROM daily_dictation_performance WHERE day < ? " +
+                "ORDER BY day, measured_app_version, measured_os_version, metric, bucket_index",
+            bindings: [.text(today)]
+        )
 
-        guard !usageRows.isEmpty || !modelRows.isEmpty else { return }
+        guard !usageRows.isEmpty || !modelRows.isEmpty || !performanceRows.isEmpty else { return }
         try self.transaction {
             for row in usageRows where row.count == 5 {
                 try self.enqueue(.usageDailySummary, at: date, properties: [
@@ -295,20 +432,36 @@ final class AnalyticsDatabase {
                     "use_count": Int(row[5]) ?? 0,
                 ])
             }
+            for summary in self.performanceSummaries(from: performanceRows) {
+                try self.enqueue(.dictationPerformanceDailySummary, at: date, properties: summary.properties)
+            }
             try self.run("DELETE FROM daily_usage WHERE day < ?", bindings: [.text(today)])
             try self.run("DELETE FROM daily_model_usage WHERE day < ?", bindings: [.text(today)])
+            try self.run("DELETE FROM daily_dictation_performance WHERE day < ?", bindings: [.text(today)])
         }
     }
 
+    /// Returns detailed events immediately and activity events only after their local week has ended.
     func readyOutbox(limit: Int, at date: Date) throws -> [AnalyticsOutboxItem] {
+        let currentWeekStart = self.calendar.dateInterval(of: .weekOfYear, for: date)?.start ?? date
         var statement: OpaquePointer?
         try self.prepare(
             "SELECT event_id, payload FROM outbox " +
-                "WHERE next_retry_at <= ? ORDER BY created_at LIMIT ?",
+                "WHERE next_retry_at <= ? " +
+                "AND (event_name != ? OR created_at < ?) " +
+                "ORDER BY created_at LIMIT ?",
             into: &statement
         )
         defer { sqlite3_finalize(statement) }
-        try self.bind([.double(date.timeIntervalSince1970), .integer(limit)], to: statement)
+        try self.bind(
+            [
+                .double(date.timeIntervalSince1970),
+                .text(AnalyticsEvent.activeUser.rawValue),
+                .double(currentWeekStart.timeIntervalSince1970),
+                .integer(limit),
+            ],
+            to: statement
+        )
 
         var items: [AnalyticsOutboxItem] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -364,7 +517,31 @@ final class AnalyticsDatabase {
             try self.execute("DELETE FROM outbox")
             try self.execute("DELETE FROM daily_usage")
             try self.execute("DELETE FROM daily_model_usage")
+            try self.execute("DELETE FROM daily_dictation_performance")
             try self.execute("DELETE FROM event_dedupe")
+            try self.execute("DELETE FROM onboarding_flows")
+            try self.execute("DELETE FROM onboarding_tryout_state")
+            try self.execute("DELETE FROM model_download_attempts")
+        }
+        try self.purgeDeletedPages()
+    }
+
+    /// Removes detailed analytics while preserving the daily active-user signal and its dedupe key.
+    func purgeDetailedAnalytics() throws {
+        try self.transaction {
+            try self.run(
+                "DELETE FROM outbox WHERE event_name != ? AND event_name != ?",
+                bindings: [
+                    .text(AnalyticsEvent.activeUser.rawValue),
+                    .text(AnalyticsEvent.dictationPerformanceDailySummary.rawValue),
+                ]
+            )
+            try self.execute("DELETE FROM daily_usage")
+            try self.execute("DELETE FROM daily_model_usage")
+            try self.run(
+                "DELETE FROM event_dedupe WHERE dedupe_key NOT LIKE ?",
+                bindings: [.text("activity:%")]
+            )
             try self.execute("DELETE FROM onboarding_flows")
             try self.execute("DELETE FROM model_download_attempts")
         }
@@ -398,6 +575,15 @@ final class AnalyticsDatabase {
             use_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(day, role, mode, provider, model)
         );
+        CREATE TABLE IF NOT EXISTS daily_dictation_performance (
+            day TEXT NOT NULL,
+            measured_app_version TEXT NOT NULL,
+            measured_os_version TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            bucket_index INTEGER NOT NULL,
+            sample_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(day, measured_app_version, measured_os_version, metric, bucket_index)
+        );
         CREATE TABLE IF NOT EXISTS event_dedupe (
             dedupe_key TEXT PRIMARY KEY,
             created_at REAL NOT NULL
@@ -407,6 +593,14 @@ final class AnalyticsDatabase {
             origin TEXT NOT NULL,
             created_at REAL NOT NULL,
             completed INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS onboarding_tryout_state (
+            flow_id TEXT PRIMARY KEY,
+            entered_at REAL NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_start_method TEXT,
+            last_outcome TEXT,
+            last_failure_stage TEXT
         );
         CREATE TABLE IF NOT EXISTS model_download_attempts (
             download_id TEXT PRIMARY KEY,
@@ -425,6 +619,12 @@ final class AnalyticsDatabase {
         approvedProperties["platform"] = "macos"
         approvedProperties["$os"] = "macOS"
         approvedProperties["app_version"] = self.appVersion
+        approvedProperties["ram_gb"] = self.systemConfiguration.ramGB
+        approvedProperties["chip"] = self.systemConfiguration.chip
+        approvedProperties["$set"] = [
+            "ram_gb": self.systemConfiguration.ramGB,
+            "chip": self.systemConfiguration.chip,
+        ]
         approvedProperties["schema_version"] = 2
 
         let payload: [String: Any] = [
@@ -484,6 +684,123 @@ final class AnalyticsDatabase {
         )
     }
 
+    private func upsertPerformanceMetric(
+        day: String,
+        measuredAppVersion: String,
+        metric: String,
+        milliseconds: Int
+    ) throws {
+        let boundedMilliseconds = min(max(milliseconds, 0), 600_000)
+        let bucketIndex = Self.performanceBucketUpperBounds.firstIndex { boundedMilliseconds <= $0 }
+            ?? Self.performanceBucketUpperBounds.count
+        try self.run(
+            "INSERT INTO daily_dictation_performance " +
+                "(day, measured_app_version, measured_os_version, metric, bucket_index, sample_count) " +
+                "VALUES (?, ?, ?, ?, ?, 1) " +
+                "ON CONFLICT(day, measured_app_version, measured_os_version, metric, bucket_index) " +
+                "DO UPDATE SET sample_count = sample_count + 1",
+            bindings: [
+                .text(day), .text(measuredAppVersion), .text(self.systemConfiguration.osVersion),
+                .text(metric), .integer(bucketIndex),
+            ]
+        )
+    }
+
+    private struct PerformanceSummaryKey: Hashable {
+        let day: String
+        let measuredAppVersion: String
+        let measuredOSVersion: String
+    }
+
+    private struct PerformanceMetricSummary {
+        var bucketCounts = Array(repeating: 0, count: performanceBucketUpperBounds.count + 1)
+        var sampleCount = 0
+    }
+
+    private struct PerformanceSummary {
+        let key: PerformanceSummaryKey
+        var asr = PerformanceMetricSummary()
+        var fluidIntelligence = PerformanceMetricSummary()
+
+        var properties: [String: Any] {
+            var properties: [String: Any] = [
+                "performance_date": self.key.day,
+                "measured_app_version": self.key.measuredAppVersion,
+                "measured_os_version": self.key.measuredOSVersion,
+                "histogram_schema_version": 1,
+            ]
+            Self.add(self.asr, prefix: "asr", to: &properties)
+            Self.add(self.fluidIntelligence, prefix: "fluid_intelligence", to: &properties)
+            return properties
+        }
+
+        private static func add(
+            _ metric: PerformanceMetricSummary,
+            prefix: String,
+            to properties: inout [String: Any]
+        ) {
+            properties["\(prefix)_sample_count"] = metric.sampleCount
+            guard metric.sampleCount > 0 else { return }
+            properties["\(prefix)_p50_bucket"] = self.quantileBucket(metric.bucketCounts, percentile: 0.50)
+            properties["\(prefix)_p95_bucket"] = self.quantileBucket(metric.bucketCounts, percentile: 0.95)
+        }
+
+        private static func quantileBucket(_ counts: [Int], percentile: Double) -> String {
+            let target = max(1, Int(ceil(Double(counts.reduce(0, +)) * percentile)))
+            var cumulative = 0
+            for (index, count) in counts.enumerated() {
+                cumulative += count
+                if cumulative >= target {
+                    guard index < performanceBucketUpperBounds.count else { return "60000_plus" }
+                    return String(performanceBucketUpperBounds[index])
+                }
+            }
+            return "unknown"
+        }
+    }
+
+    private func performanceSummaries(from rows: [[String]]) -> [PerformanceSummary] {
+        var summaries: [PerformanceSummaryKey: PerformanceSummary] = [:]
+        for row in rows where row.count == 6 {
+            let key = PerformanceSummaryKey(
+                day: row[0],
+                measuredAppVersion: row[1],
+                measuredOSVersion: row[2]
+            )
+            var summary = summaries[key] ?? PerformanceSummary(key: key)
+            let bucketIndex = Int(row[4]) ?? -1
+            let sampleCount = Int(row[5]) ?? 0
+            if row[3] == "asr" {
+                Self.mergePerformanceRow(
+                    into: &summary.asr,
+                    bucketIndex: bucketIndex,
+                    sampleCount: sampleCount
+                )
+            } else if row[3] == "fluid_intelligence" {
+                Self.mergePerformanceRow(
+                    into: &summary.fluidIntelligence,
+                    bucketIndex: bucketIndex,
+                    sampleCount: sampleCount
+                )
+            }
+            summaries[key] = summary
+        }
+        return summaries.values.sorted {
+            ($0.key.day, $0.key.measuredAppVersion, $0.key.measuredOSVersion) <
+                ($1.key.day, $1.key.measuredAppVersion, $1.key.measuredOSVersion)
+        }
+    }
+
+    private static func mergePerformanceRow(
+        into metric: inout PerformanceMetricSummary,
+        bucketIndex: Int,
+        sampleCount: Int
+    ) {
+        guard metric.bucketCounts.indices.contains(bucketIndex) else { return }
+        metric.bucketCounts[bucketIndex] += sampleCount
+        metric.sampleCount += sampleCount
+    }
+
     private func activeOnboardingFlow(origin: AnalyticsOnboardingOrigin, at date: Date) throws -> String {
         if let existing = try self.string(
             "SELECT flow_id FROM onboarding_flows WHERE completed = 0 AND origin = ? " +
@@ -498,6 +815,58 @@ final class AnalyticsDatabase {
             bindings: [.text(flowID), .text(origin.rawValue), .double(date.timeIntervalSince1970)]
         )
         return flowID
+    }
+
+    private struct OnboardingTryoutState {
+        let enteredAt: TimeInterval
+        let attemptCount: Int
+        let lastStartMethod: String?
+        let lastFailureStage: String?
+    }
+
+    private func ensureOnboardingTryoutState(flowID: String, enteredAt: Date) throws {
+        try self.run(
+            "INSERT OR IGNORE INTO onboarding_tryout_state (flow_id, entered_at) VALUES (?, ?)",
+            bindings: [.text(flowID), .double(enteredAt.timeIntervalSince1970)]
+        )
+    }
+
+    private func onboardingTryoutState(flowID: String) throws -> OnboardingTryoutState {
+        let rows = try self.query(
+            "SELECT entered_at, attempt_count, COALESCE(last_start_method, ''), " +
+                "COALESCE(last_failure_stage, '') " +
+                "FROM onboarding_tryout_state WHERE flow_id = ?",
+            bindings: [.text(flowID)]
+        )
+        guard let row = rows.first, row.count == 4 else {
+            throw AnalyticsDatabaseError.sqlite("Missing onboarding tryout state")
+        }
+        return OnboardingTryoutState(
+            enteredAt: TimeInterval(row[0]) ?? 0,
+            attemptCount: Int(row[1]) ?? 0,
+            lastStartMethod: row[2].isEmpty ? nil : row[2],
+            lastFailureStage: row[3].isEmpty ? nil : row[3]
+        )
+    }
+
+    private static func onboardingTryoutAttemptCountBucket(_ count: Int) -> String {
+        switch count {
+        case 1: "1"
+        case 2: "2"
+        default: "3+"
+        }
+    }
+
+    private static func onboardingTryoutDurationBucket(_ duration: TimeInterval) -> String {
+        let duration = max(0, duration)
+        guard duration < 30 else { return "30s_plus" }
+
+        let upperBound = max(0.5, ceil(duration * 2) / 2)
+        if upperBound == 0.5 { return "500ms" }
+
+        let wholeSeconds = Int(upperBound)
+        if upperBound == Double(wholeSeconds) { return "\(wholeSeconds)s" }
+        return "\(wholeSeconds)_5s"
     }
 
     private func insertDedupeKey(_ key: String, date: Date) throws -> Bool {
@@ -605,6 +974,8 @@ final class AnalyticsDatabase {
                 result = data.withUnsafeBytes { bytes in
                     sqlite3_bind_blob(statement, index, bytes.baseAddress, Int32(bytes.count), transient)
                 }
+            case .null:
+                result = sqlite3_bind_null(statement, index)
             }
             guard result == SQLITE_OK else { throw self.lastError() }
         }
@@ -620,4 +991,5 @@ private enum SQLiteBinding {
     case integer(Int)
     case double(Double)
     case blob(Data)
+    case null
 }

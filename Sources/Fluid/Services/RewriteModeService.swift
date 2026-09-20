@@ -185,12 +185,7 @@ final class RewriteModeService: ObservableObject {
         let builtInDefaultPrompt = SettingsStore.defaultSystemPromptText(for: promptMode)
         let systemPromptBeforeContext = settings.effectiveSystemPrompt(for: promptMode, appBundleID: appBundleID)
         // Use global provider/model when linked, otherwise use Edit Mode's independent settings.
-        let providerID: String = {
-            if settings.rewriteModeLinkedToGlobal {
-                return settings.selectedProviderID
-            }
-            return settings.rewriteModeSelectedProviderID
-        }()
+        let providerID = settings.effectiveRewriteModeProviderID
         guard !providerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(
                 domain: "RewriteMode",
@@ -198,14 +193,8 @@ final class RewriteModeService: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "No verified AI provider selected"]
             )
         }
-        guard !self.isPrivateAIProviderID(providerID) else {
-            throw NSError(
-                domain: "RewriteMode",
-                code: -5,
-                userInfo: [NSLocalizedDescriptionKey: "\(PrivateAIProviderFeature.displayName) for Edit Mode is coming soon. Choose a verified chat provider or turn Sync off."]
-            )
-        }
-        guard self.isProviderVerified(providerID, settings: settings) else {
+        let usesPrivateAIProvider = self.isPrivateAIProviderID(providerID)
+        guard usesPrivateAIProvider || self.isProviderVerified(providerID, settings: settings) else {
             throw NSError(
                 domain: "RewriteMode",
                 code: -3,
@@ -241,25 +230,7 @@ final class RewriteModeService: ObservableObject {
             self.logPromptTrace("Conversation input (Q/history)", value: messageDump.isEmpty ? "<empty>" : messageDump)
         }
 
-        let model: String = {
-            if settings.rewriteModeLinkedToGlobal {
-                let key: String
-                if ModelRepository.shared.isBuiltIn(providerID) {
-                    key = providerID
-                } else if providerID.hasPrefix("custom:") {
-                    key = providerID
-                } else {
-                    key = "custom:\(providerID)"
-                }
-                return settings.selectedModelByProvider[key]
-                    ?? settings.selectedModel
-                    ?? ModelRepository.shared.defaultModels(for: providerID).first
-                    ?? ""
-            }
-            return settings.rewriteModeSelectedModel
-                ?? ModelRepository.shared.defaultModels(for: providerID).first
-                ?? ""
-        }()
+        let model = settings.effectiveRewriteModeSelectedModel
         guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(
                 domain: "RewriteMode",
@@ -267,12 +238,21 @@ final class RewriteModeService: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "No AI model selected"]
             )
         }
-        guard !PrivateAIIntegrationService.shouldHandleDictation(model: model) else {
-            throw NSError(
-                domain: "RewriteMode",
-                code: -6,
-                userInfo: [NSLocalizedDescriptionKey: "\(PrivateAIProviderFeature.displayName) for Edit Mode is coming soon. Choose a verified chat provider model."]
-            )
+        var runtimeModel = model
+        var localModelPath = PrivateAIIntegrationService.configuredLocalModelPath
+        if usesPrivateAIProvider {
+            guard let verifiedModelID = PrivateAIProviderPromptFormat.verifiedModelID(for: model, settings: settings),
+                  let verifiedModel = PrivateAIModelRegistry.model(id: verifiedModelID),
+                  let verifiedModelPath = PrivateAIIntegrationService.localModelPath(for: verifiedModel)
+            else {
+                throw NSError(
+                    domain: "RewriteMode",
+                    code: -5,
+                    userInfo: [NSLocalizedDescriptionKey: "Selected Fluid-1 model is not installed and verified"]
+                )
+            }
+            runtimeModel = verifiedModelID
+            localModelPath = verifiedModelPath
         }
         self.appendDiagnosticLog(
             "LLM config | writeMode=\(isWriteMode) | linkedToGlobal=\(settings.rewriteModeLinkedToGlobal) | " +
@@ -288,6 +268,35 @@ final class RewriteModeService: ObservableObject {
             baseURL = ModelRepository.shared.defaultBaseURL(for: providerID)
         } else {
             baseURL = ""
+        }
+
+        if usesPrivateAIProvider || PrivateAIIntegrationService.shouldHandleDictation(model: model) {
+            let inputText = messages.map {
+                let role = $0.role == .user ? "user" : "assistant"
+                return "[\(role)]\n\($0.content)"
+            }.joined(separator: "\n\n")
+            let response = try await PrivateAIIntegrationService.shared.rewrite(
+                inputText,
+                systemPrompt: systemPrompt,
+                runtime: PrivateAIIntegrationService.RuntimeConfiguration(
+                    selectedProviderID: providerID,
+                    providerKey: self.providerKey(for: providerID),
+                    baseURL: baseURL,
+                    model: runtimeModel,
+                    apiKey: apiKey,
+                    localModelPath: localModelPath,
+                    usesStablePromptPrefixKVCache: settings.privateAIPrefixKVCacheEnabled,
+                    usesFluid1Boost: settings.privateAIBoostEnabled,
+                    contextTokenLimit: settings.privateAIContextTokenLimit
+                ),
+                context: PrivateAIIntegrationService.AppContext(
+                    appName: "",
+                    bundleID: appBundleID ?? "",
+                    windowTitle: "",
+                    appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+                )
+            )
+            return response.outputText
         }
 
         // Build messages array for LLMClient

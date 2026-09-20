@@ -289,6 +289,7 @@ final class DictationPostProcessingService {
             model: resolved.model,
             baseURL: resolved.baseURL,
             apiKey: resolved.apiKey,
+            rotationProviderID: resolved.providerKey,
             streaming: false,
             tools: [],
             temperature: settings.isTemperatureUnsupported(resolved.model) ? nil : 0.2,

@@ -334,6 +334,7 @@ final class RewriteModeService: ObservableObject {
             model: model,
             baseURL: baseURL,
             apiKey: apiKey,
+            rotationProviderID: providerID,
             streaming: enableStreaming,
             tools: [],
             temperature: isTemperatureUnsupported ? nil : 0.7,

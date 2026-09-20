@@ -864,6 +864,7 @@ final class CommandModeService: ObservableObject {
             model: model,
             baseURL: baseURL,
             apiKey: apiKey,
+            rotationProviderID: providerID,
             streaming: enableStreaming,
             tools: [TerminalService.toolDefinition],
             temperature: isTemperatureUnsupported ? nil : 0.1,

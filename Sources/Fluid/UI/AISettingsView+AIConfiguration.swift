@@ -1191,7 +1191,7 @@ extension AIEnhancementSettingsView {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                     HStack(alignment: .center, spacing: 8) {
-                        SecureField("Enter API key", text: apiKeyBinding)
+                        SecureField("Enter API key(s), one per line to rotate", text: apiKeyBinding)
                             .textFieldStyle(.plain)
                             .font(.system(size: 13))
                             .padding(.horizontal, managementLayout ? 12 : 6)
@@ -2215,7 +2215,7 @@ extension AIEnhancementSettingsView {
                             .foregroundStyle(.secondary)
                     }
                     HStack(alignment: .center, spacing: 8) {
-                        SecureField("Enter API key", text: apiKeyBinding)
+                        SecureField("Enter API key(s), one per line to rotate", text: apiKeyBinding)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(size: 13))
                             .frame(maxWidth: 200)
@@ -2713,7 +2713,7 @@ extension AIEnhancementSettingsView {
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
-                    SecureField("Enter API key", text: self.$viewModel.newProviderApiKey)
+                    SecureField("Enter API key(s), one per line to rotate", text: self.$viewModel.newProviderApiKey)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 13))
                         .onTapGesture {

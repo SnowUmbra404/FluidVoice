@@ -38,7 +38,12 @@ jobs:
       - name: Build unsigned app
         run: |
           set -o pipefail
-          FLUIDVOICE_CONFIGURATION=Release ./build.sh unsigned 2>&1 | tail -40
+          FLUIDVOICE_CONFIGURATION=Release ./build.sh unsigned 2>&1 | tee /tmp/fluid-build.log | tail -40
+
+      - name: Show compiler errors on failure
+        if: failure()
+        run: |
+          grep -B2 -A8 ': error:' /tmp/fluid-build.log | head -80
 
       - name: Create DMG
         run: |

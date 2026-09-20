@@ -990,6 +990,10 @@ final class SettingsStore: ObservableObject {
         - Do NOT add filler words (um, uh) to the output
         - PRESERVE ordinals in lists: "first call client, second review contract" → keep "First" and "Second"
         - PRESERVE politeness words: "please", "thank you" at end of sentences
+
+        ## Precedence
+        - If custom instructions below conflict with the above, follow the custom instructions.
+        - When any rule is ambiguous, preserve the speaker's words unchanged.
         """
     }
 
@@ -1287,12 +1291,7 @@ final class SettingsStore: ObservableObject {
     /// the transcript is appended after a blank line, matching the pre-PR
     /// behaviour of sending the transcript as a separate user message.
     static func renderDictationUserMessage(promptText: String, transcript: String) -> String {
-        if promptText.contains(self.transcriptPlaceholder) {
-            return promptText.replacingOccurrences(of: self.transcriptPlaceholder, with: transcript)
-        }
-        let trimmedPrompt = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmedPrompt.isEmpty { return transcript }
-        return promptText + "\n\n" + transcript
+        TranscriptPlaceholder.render(template: promptText, transcript: transcript)
     }
 
     private func defaultPromptResolution(
@@ -1544,15 +1543,22 @@ final class SettingsStore: ObservableObject {
         return try self.keychain.fetchAllKeys()
     }
 
-    /// Securely retrieve API key for a provider, handling custom prefix logic
+    /// Securely retrieve the active API key for a provider, handling custom prefix logic.
+    /// When several keys are stored for rotation, this returns the first pool key.
     func getAPIKey(for providerID: String) -> String? {
-        let keys = self.providerAPIKeys
-        // Try exact match first
-        if let key = keys[providerID] { return key }
+        self.apiKeyPool(for: providerID).first
+    }
 
-        // Try canonical key format (custom:ID)
-        let canonical = self.canonicalProviderKey(for: providerID)
-        return keys[canonical]
+    /// Raw stored key value, used for verification fingerprints so any pool edit re-verifies.
+    func apiKeyStorageValue(for providerID: String) -> String {
+        let keys = (try? self.keychain.fetchAllKeys()) ?? [:]
+        if let key = keys[providerID] { return key }
+        return keys[self.canonicalProviderKey(for: providerID)] ?? ""
+    }
+
+    /// Rotation pool parsed from the stored value: one key per line, comma, or whitespace.
+    func apiKeyPool(for providerID: String) -> [String] {
+        APIKeyPool.keys(from: self.apiKeyStorageValue(for: providerID))
     }
 
     var selectedProviderID: String {
@@ -3918,7 +3924,7 @@ final class SettingsStore: ObservableObject {
         guard let stored = self.verifiedProviderFingerprints[key] else { return false }
 
         let baseURL = self.providerBaseURLForVerification(for: trimmed)
-        let apiKey = (self.getAPIKey(for: trimmed) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let apiKey = self.apiKeyStorageValue(for: trimmed)
         guard ModelRepository.shared.isLocalEndpoint(baseURL) || !apiKey.isEmpty else { return false }
 
         return self.providerFingerprint(baseURL: baseURL, apiKey: apiKey) == stored

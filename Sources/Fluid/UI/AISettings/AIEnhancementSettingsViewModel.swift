@@ -987,7 +987,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
                         self.modelVerifications.recordSuccess(verificationIdentity)
                         self.updateConnectionStatus(.success, for: providerID)
                         self.setEditingAPIKey(false, for: providerID)
-                        self.storeVerificationFingerprint(for: providerID, baseURL: baseURL, apiKey: apiKey)
+                        self.storeVerificationFingerprint(for: providerID, baseURL: baseURL, apiKey: self.providerAPIKeys[self.providerKey(for: providerID)] ?? apiKey)
                     }
                 } else {
                     // Parse error response for more details
@@ -1508,7 +1508,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         let key = self.providerKey(for: providerID)
         guard let stored = self.settings.verifiedProviderFingerprints[key] else { return }
         let baseURL = self.providerBaseURL(for: providerID)
-        let apiKey = self.providerAPIKey(for: providerID)
+        let apiKey = self.providerAPIKeys[key] ?? self.providerAPIKey(for: providerID)
         let current = self.fingerprint(baseURL: baseURL, apiKey: apiKey)
         if current != stored {
             self.settings.verifiedProviderFingerprints.removeValue(forKey: key)

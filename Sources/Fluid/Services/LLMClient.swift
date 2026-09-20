@@ -122,7 +122,7 @@ final nonisolated class LLMClient: @unchecked Sendable {
         let messages: [[String: Any]]
         let model: String
         let baseURL: String
-        let apiKey: String
+        var apiKey: String
         let streaming: Bool
         let tools: [[String: Any]]
         let temperature: Double?
@@ -141,6 +141,10 @@ final nonisolated class LLMClient: @unchecked Sendable {
         var maxRetries: Int = 3
         var retryDelayMs: Int = 200
 
+        /// Provider ID for multi-key rotation. When set and the provider has a
+        /// key pool, rate-limit/server failures rotate to the next healthy key.
+        var rotationProviderID: String? = nil
+
         /// Timeout configuration (nil = use default)
         var timeoutSeconds: TimeInterval?
 
@@ -156,6 +160,7 @@ final nonisolated class LLMClient: @unchecked Sendable {
             model: String,
             baseURL: String,
             apiKey: String,
+            rotationProviderID: String? = nil,
             streaming: Bool = true,
             tools: [[String: Any]] = [],
             temperature: Double? = nil,
@@ -167,6 +172,7 @@ final nonisolated class LLMClient: @unchecked Sendable {
             self.model = model
             self.baseURL = baseURL
             self.apiKey = apiKey
+            self.rotationProviderID = rotationProviderID
             self.streaming = streaming
             self.tools = tools
             self.temperature = temperature
@@ -183,25 +189,49 @@ final nonisolated class LLMClient: @unchecked Sendable {
     /// Handles thinking token extraction, tool call parsing, and retries.
     @concurrent func call(_ config: Config) async throws -> Response {
         self.benchmark(config, "call_enter")
-        var request = try buildRequest(config)
-        self.benchmark(config, "request_built bodyBytes=\(request.httpBody?.count ?? 0)")
+        let pool = SettingsStore.shared.apiKeyPool(for: config.rotationProviderID ?? "")
+        let keys = pool.isEmpty ? [config.apiKey] : pool
+        let ordered = await APIKeyRotator.shared.orderedKeys(keys, provider: config.rotationProviderID ?? "")
+        var lastError: Error?
+        for (index, key) in ordered.enumerated() {
+            var attempt = config
+            attempt.apiKey = key
+            var request = try buildRequest(attempt)
+            self.benchmark(config, "request_built bodyBytes=\(request.httpBody?.count ?? 0)")
 
-        // Apply timeout to the request itself
-        let timeout = config.timeoutSeconds ?? Self.defaultTimeoutSeconds
-        request.timeoutInterval = timeout
+            // Apply timeout to the request itself
+            let timeout = attempt.timeoutSeconds ?? Self.defaultTimeoutSeconds
+            request.timeoutInterval = timeout
 
-        // Execute the request. We rely on URLRequest/URLSession timeouts (30s default) rather
-        // than racing a separate "timeout task". A task-group timeout wrapper can accidentally
-        // keep the caller suspended until the full timeout elapses, which is the exact stall
-        // we want to eliminate for overlay responsiveness.
-        do {
-            let response = try await self.executeWithRetry(request: request, config: config)
-            self.benchmark(config, "call_return")
-            return response
-        } catch {
-            self.benchmark(config, "call_fail")
-            throw error
+            // Execute the request. We rely on URLRequest/URLSession timeouts (30s default) rather
+            // than racing a separate "timeout task". A task-group timeout wrapper can accidentally
+            // keep the caller suspended until the full timeout elapses, which is the exact stall
+            // we want to eliminate for overlay responsiveness.
+            do {
+                let response = try await self.executeWithRetry(request: request, config: attempt)
+                self.benchmark(config, "call_return")
+                return response
+            } catch let error as LLMError {
+                if case let .httpError(code, _) = error,
+                   APIKeyRotator.isRotatable(statusCode: code),
+                   index < ordered.count - 1 {
+                    await APIKeyRotator.shared.markDown(provider: config.rotationProviderID ?? "", key: key, statusCode: code)
+                    DebugLogger.shared.warning("LLMClient: HTTP \(code), rotating API key (\(index + 1)/\(ordered.count))", source: "LLMClient")
+                    lastError = error
+                    continue
+                }
+                self.benchmark(config, "call_fail")
+                throw error
+            } catch {
+                self.benchmark(config, "call_fail")
+                throw error
+            }
         }
+
+        self.benchmark(config, "call_fail")
+        throw lastError ?? LLMError.networkError(
+            NSError(domain: "LLMClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "Request failed after retries"])
+        )
     }
 
     /// Execute request with retry logic (extracted for timeout wrapper)
